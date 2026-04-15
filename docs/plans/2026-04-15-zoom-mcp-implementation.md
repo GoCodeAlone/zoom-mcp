@@ -1173,18 +1173,44 @@ git commit -m "feat: add mcp.tool trigger for pipeline registration"
 
 **Files:**
 - Modify: `~/Projects/workflow-plugin-mcp/plugin.go` — the template's main plugin type. Register `ServerModule`, `StdioTransportModule`, `HTTPTransportModule` via `ModuleFactories()`. Register `ToolTrigger` via `TriggerFactories()`.
+- Modify: `~/Projects/workflow-plugin-mcp/internal/mcp/server.go` — ensure `ServerModule` declares a modular dependency on the tool-registration phase so it starts after triggers have registered.
 - Create: `~/Projects/workflow-plugin-mcp/internal/mcp/e2e_test.go`
+- Create: `~/Projects/workflow-plugin-mcp/internal/mcp/lifecycle_test.go`
 
 **Step 1:** Implement `EnginePlugin` interface per the template.
 
-**Step 2:** Write E2E test: full YAML with `mcp.server` + `mcp.stdio_transport` (using InMemoryTransport instead) + a pipeline with `mcp.tool` trigger. Start engine, send a `tools/call` from an in-memory MCP client, assert output.
+**Step 2:** Declare lifecycle ordering on `ServerModule`. The design requires `mcp.server` to start only after every `mcp.tool` trigger has registered its tool with the server, so the initial `tools/list` response is complete.
 
-**Step 3:** Run tests.
+Use modular's dependency declaration — whichever of these the current `github.com/GoCodeAlone/modular` exposes (check imports first):
 
-**Step 4:** Commit.
+- If modular supports `DependsOn() []string`, declare it on `ServerModule` referencing the trigger service name(s).
+- If modular uses a start-order interface (e.g. `StartsAfter`), use that.
+- Otherwise, have `ToolTrigger.Register()` push into a shared registry module that `ServerModule` consumes, and wire the registry as a dependency.
+
+Concretely:
+
+```go
+// internal/mcp/server.go
+func (m *ServerModule) DependsOn() []string {
+    // The tool registry is populated by mcp.tool triggers at their Register()
+    // step; depending on it guarantees ServerModule.Start runs after all
+    // triggers have registered their tools.
+    return []string{"mcp.tool-registry"}
+}
+```
+
+If no explicit registry module exists, create one (`ToolRegistryModule`) whose `Register()` is a no-op and whose presence in the module graph makes the dependency edge valid; triggers obtain it via the DI container and call `Registry.Add(name, handler, schema)`; `ServerModule.Start` iterates `Registry.All()` to populate the mcp.Server before starting transports.
+
+**Step 3:** Write lifecycle test (`lifecycle_test.go`): build an engine with the plugin, 2 pipelines each with `mcp.tool` triggers, and assert that by the time `ServerModule.Start` is called, both tools are visible via `mcp.Server.ListTools()` (or whatever the go-sdk exposes).
+
+**Step 4:** Write E2E test: full YAML with `mcp.server` + `mcp.stdio_transport` (using InMemoryTransport instead) + a pipeline with `mcp.tool` trigger. Start engine, send a `tools/call` from an in-memory MCP client, assert output.
+
+**Step 5:** Run tests.
+
+**Step 6:** Commit.
 
 ```
-git commit -m "feat: register modules and trigger in EnginePlugin; add E2E test"
+git commit -m "feat: register modules and trigger in EnginePlugin; enforce server-after-triggers lifecycle; add E2E test"
 ```
 
 ---
@@ -1336,7 +1362,60 @@ git commit -m "feat(config): add modules + setup flow pipelines"
 
 ### Task 3.4: Workflow YAML — one tool pipeline at a time
 
-15 sub-tasks, one per tool. Same pattern each time: add a `pipelines.<name>` entry with `trigger: { type: mcp.tool, config: {...} }` + `steps: [...]`. Commit after each one so progress is visible.
+15 sub-tasks, one per tool, plus one shared error-mapping sub-task (3.4.0) that every pipeline inherits. Same pattern each time: add a `pipelines.<name>` entry with `trigger: { type: mcp.tool, config: {...} }` + `steps: [...]`. Commit after each one so progress is visible.
+
+**Sub-task 3.4.0: Shared error-mapping helper and 429 handling**
+
+All 15 tool pipelines must produce the unified error shape on non-2xx responses. Define it once and reuse.
+
+**Files:**
+- Modify: `~/Projects/zoom-mcp/config/zoom-mcp.yaml` — add a reusable `error_mapping` anchor or helper pipeline.
+
+**Step 1:** Add the following near the top of the YAML (under `workflows:` or as a template block if Workflow supports YAML anchors):
+
+```yaml
+# Reusable error mapper: turns any non-2xx Zoom response into the
+# unified `{ ok: false, error: { code, message, retry_after } }` shape.
+# Callers invoke it via step.transform with `.response` in scope.
+error_shapes:
+  default_map: |
+    {{- if eq .response.status 401 -}}
+    {"ok": false, "error": {"code": "not_authenticated", "message": "Zoom OAuth token is missing or invalid; run setup flow."}}
+    {{- else if eq .response.status 403 -}}
+    {"ok": false, "error": {"code": "scope_missing", "message": "{{ .response.body.message }}"}}
+    {{- else if eq .response.status 404 -}}
+    {"ok": false, "error": {"code": "not_found", "message": "{{ .response.body.message }}"}}
+    {{- else if eq .response.status 429 -}}
+    {"ok": false, "error": {"code": "rate_limited", "message": "Zoom rate limit exceeded", "retry_after": {{ or (index .response.headers "Retry-After") 60 }}}}
+    {{- else -}}
+    {"ok": false, "error": {"code": "zoom_error", "message": "{{ .response.body.message | default (printf "HTTP %d" .response.status) }}"}}
+    {{- end -}}
+```
+
+**Step 2:** In each tool pipeline (sub-tasks 3.4.1–3.4.15) the final `step.transform` or `step.raw_response` selects between success and the shared error mapper based on `.response.status >= 400`. Pattern:
+
+```yaml
+- type: step.transform
+  name: shape_output
+  config:
+    template: |
+      {{- if lt .response.status 400 -}}
+      {"ok": true, "data": {{ toJson .response.body }}}
+      {{- else -}}
+      {{ template "error_shapes.default_map" . }}
+      {{- end -}}
+```
+
+**Step 3:** Write a unit test that feeds a synthetic `.response` with status=429 and `Retry-After: 30` into the template and asserts the output equals `{"ok": false, "error": {"code": "rate_limited", "message": "Zoom rate limit exceeded", "retry_after": 30}}`.
+
+**Step 4:** Run the test — PASS.
+
+**Step 5:** Commit.
+
+```
+git add config/zoom-mcp.yaml
+git commit -m "feat(config): shared error mapper with 429 retry_after extraction"
+```
 
 **Sub-task 3.4.1: `get_me`** — single `step.http_call` to `/users/me`, `step.transform` wraps output.
 
@@ -1387,12 +1466,14 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/GoCodeAlone/modular"
 	"github.com/GoCodeAlone/workflow"
 	// plus all the plugin imports for init() side effects
 	_ "github.com/GoCodeAlone/workflow/secrets"
 	mcpplugin "github.com/GoCodeAlone/workflow-plugin-mcp"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/pkg/browser"
 )
 
@@ -1442,17 +1523,48 @@ func main() {
 
 	// Before starting, check keychain state and open browser if needed.
 	ready := checkKeychainReady(engine)
+	setupURL := "http://127.0.0.1:8765/setup"
 	if !ready && !*noBrowser {
-		browser.OpenURL("http://127.0.0.1:8765/setup")
-		fmt.Fprintln(os.Stderr, "zoom-mcp: credentials not configured; opened http://127.0.0.1:8765/setup")
+		browser.OpenURL(setupURL)
+		fmt.Fprintln(os.Stderr, "zoom-mcp: credentials not configured; opened "+setupURL)
 	} else if !ready {
-		fmt.Fprintln(os.Stderr, "zoom-mcp: credentials not configured; visit http://127.0.0.1:8765/setup")
+		fmt.Fprintln(os.Stderr, "zoom-mcp: credentials not configured; visit "+setupURL)
+	}
+
+	// Schedule an MCP notifications/message once transports have started, so
+	// Claude Desktop (and any other client) can surface the setup URL in UI.
+	// Best-effort — if the server isn't up yet or the notification fails, the
+	// stderr message above + browser-open are already user-visible.
+	if !ready {
+		go func() {
+			mcpServer := resolveMCPServer(engine) // DI lookup; returns nil until started
+			for i := 0; i < 20 && mcpServer == nil; i++ {
+				time.Sleep(100 * time.Millisecond)
+				mcpServer = resolveMCPServer(engine)
+			}
+			if mcpServer == nil {
+				return
+			}
+			_ = mcpServer.Notify(ctx, "notifications/message", map[string]any{
+				"level":  "info",
+				"logger": "zoom-mcp",
+				"data":   "Zoom credentials not configured. Complete setup at " + setupURL,
+			})
+		}()
 	}
 
 	if err := engine.Run(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "zoom-mcp: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// resolveMCPServer pulls the *mcp.Server instance out of the DI container.
+// Returns nil if the mcp.server module hasn't finished starting yet.
+func resolveMCPServer(engine *workflow.Engine) *mcp.Server {
+	// Use modular's service-lookup API; exact call depends on engine API.
+	// Placeholder: engine.Services().Get("mcp.server")
+	return nil
 }
 
 func configShow() {
@@ -1486,20 +1598,31 @@ git commit -m "feat: cmd/zoom-mcp bootstrap + config CLI + setup auto-open"
 **Files:**
 - Create: `~/Projects/zoom-mcp/cmd/zoom-mcp/e2e_test.go`
 
-**Step 1:** Write integration test that:
-1. Spins up a `httptest.Server` impersonating Zoom (both OAuth token endpoint and a subset of API endpoints).
-2. Spins up the zoom-mcp engine pointed at a test config where `zoom-client.auth.token_url` and `base_url` point to the httptest server.
-3. Uses an `InMemoryTransport` MCP client to call `list_meetings`, `get_transcript`, `get_meeting_summary`.
-4. Asserts the correct output shape.
-5. Also tests the 401-refresh path: token in store has expired `expires_at`, Zoom server responds 401 on first try with expired token, 200 after refresh.
+**Step 1:** Write integration test that exercises every required scenario from the design doc's Testing section:
 
-**Step 2:** Run test — PASS.
+1. **Setup.** Spin up a `httptest.Server` impersonating Zoom (OAuth token endpoint + a subset of API endpoints, configurable per-test). Spin up the zoom-mcp engine pointed at a test config where `zoom-client.auth.token_url` and `base_url` point to the httptest server. Use an `InMemoryTransport` MCP client.
+
+2. **Happy path.** Call `list_meetings`, `get_meeting`, `get_me`. Assert `ok: true` and the expected data shape.
+
+3. **401 refresh.** Token in store has expired `expires_at`. Zoom mock responds 401 on first call with the expired token, 200 after the client exchanges the refresh token. Assert tool call succeeds and the new access token is persisted to the keychain provider.
+
+4. **Pagination (3 pages).** `list_meetings` mock responds with `next_page_token` on pages 1 and 2, empty on page 3. Assert the tool returns all accumulated meetings in one response and that `step.while` stopped correctly.
+
+5. **Missing transcript → 404 fallback → `transcript_unavailable`.** `get_transcript` mock responds 404 on the direct `/meetings/{id}/transcript` endpoint. The fallback path (recordings files + download via `zoom-download-client`) also finds no VTT file. Assert the tool returns `{ ok: false, error: { code: "transcript_unavailable", ... } }`.
+
+6. **Missing AI Companion summary → 404 → `ai_companion_unavailable`.** `get_meeting_summary` mock responds 404. Assert the tool returns `{ ok: false, error: { code: "ai_companion_unavailable", ... } }`.
+
+7. **Rate limit → 429 → `rate_limited` with retry_after.** Any tool; mock responds 429 with `Retry-After: 30`. Assert the tool returns `{ ok: false, error: { code: "rate_limited", retry_after: 30 } }`.
+
+Use table-driven tests where natural (one table per scenario shape).
+
+**Step 2:** Run test — PASS. Expected: all 7 sub-scenarios pass.
 
 **Step 3:** Commit.
 
 ```
 git add cmd/zoom-mcp/e2e_test.go
-git commit -m "test: E2E against mock Zoom covering happy path + 401 refresh + pagination"
+git commit -m "test: E2E against mock Zoom covering happy path, 401 refresh, pagination, 404 transcript, 404 AI Companion, 429 rate limit"
 ```
 
 ---
