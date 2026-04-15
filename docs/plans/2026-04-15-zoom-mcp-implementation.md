@@ -1561,10 +1561,21 @@ func main() {
 
 // resolveMCPServer pulls the *mcp.Server instance out of the DI container.
 // Returns nil if the mcp.server module hasn't finished starting yet.
+//
+// The Workflow engine exposes a service registry via modular's container.
+// The mcp.server module registers itself under the name "mcp.server" in
+// workflow-plugin-mcp's ServerModule.Register(). We look it up here and
+// type-assert to *mcp.Server.
 func resolveMCPServer(engine *workflow.Engine) *mcp.Server {
-	// Use modular's service-lookup API; exact call depends on engine API.
-	// Placeholder: engine.Services().Get("mcp.server")
-	return nil
+	svc, ok := engine.Container().Lookup("mcp.server")
+	if !ok {
+		return nil
+	}
+	server, ok := svc.(*mcp.Server)
+	if !ok {
+		return nil
+	}
+	return server
 }
 
 func configShow() {
@@ -1580,15 +1591,25 @@ func checkKeychainReady(engine *workflow.Engine) bool {
 }
 ```
 
-**Step 2:** Run `go build ./cmd/zoom-mcp` — compiles.
+**Step 2:** Verify `resolveMCPServer` uses the correct modular service-lookup API. At time of writing the planner has not confirmed the exact method name; the sketch above uses `engine.Container().Lookup("mcp.server")`. When implementing:
 
-**Step 3:** Run `./zoom-mcp config show` — exits cleanly (prints "no credentials configured" or similar when keychain is empty).
+- Read `github.com/GoCodeAlone/modular` to find the actual service-lookup API (likely one of `GetService`, `Resolve`, `Lookup`, or `Services().Get`).
+- Read `workflow-plugin-mcp/internal/mcp/server.go` (Task 2.2) to confirm the exact service name ServerModule registers under (`"mcp.server"` is the target; verify).
+- Replace the two `engine.Container().Lookup(...)` call sites with the correct API.
 
-**Step 4:** Commit.
+**Step 3:** Run `go build ./cmd/zoom-mcp` — compiles.
+
+**Step 4:** Run `./zoom-mcp config show` — exits cleanly (prints "no credentials configured" or similar when keychain is empty).
+
+**Step 5:** Write a unit test `cmd/zoom-mcp/main_test.go` that builds a fake engine with a pre-registered `*mcp.Server` under the expected service name and asserts `resolveMCPServer(engine) != nil`. This guards against silent notification-path regressions if the modular API or service name changes.
+
+**Step 6:** Run `go test ./cmd/zoom-mcp/...` — PASS.
+
+**Step 7:** Commit.
 
 ```
-git add cmd/zoom-mcp/main.go
-git commit -m "feat: cmd/zoom-mcp bootstrap + config CLI + setup auto-open"
+git add cmd/zoom-mcp/main.go cmd/zoom-mcp/main_test.go
+git commit -m "feat: cmd/zoom-mcp bootstrap + config CLI + setup auto-open + notifications/message"
 ```
 
 ---
