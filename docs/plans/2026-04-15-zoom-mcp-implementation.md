@@ -967,6 +967,38 @@ git -C ~/Projects/workflow checkout main
 
 All work in `~/Projects/workflow-plugin-mcp` (new repo created from template).
 
+### Architecture: dual-mode plugin
+
+The plugin must be usable two ways:
+
+1. **In-process Go library** — zoom-mcp imports the plugin and registers it on `StdEngine` directly. This is the primary path (matches design §156 "Register plugin imports"). Requires the in-process `plugin.EnginePlugin` interface (`ModuleFactories() map[string]plugin.ModuleFactory`, `TriggerFactories() map[string]plugin.TriggerFactory`, `Capabilities()`, `ModuleSchemas()`).
+2. **External gRPC subprocess** — host process discovers a built binary via `plugin.json` and spawns it. Uses `github.com/GoCodeAlone/workflow/plugin/external/sdk` (`sdk.PluginProvider`, `sdk.ModuleProvider`, `sdk.TriggerProvider`; instances are `sdk.ModuleInstance` / `sdk.TriggerInstance`).
+
+To avoid duplicated module logic, the canonical module/trigger implementations live in a single public package; the two modes are thin adapters wrapping the same core.
+
+**Layout:**
+
+```
+workflow-plugin-mcp/
+├── cmd/workflow-plugin-mcp/main.go   # gRPC entry: sdk.Serve(internal.NewPlugin())
+├── mcp/                              # PUBLIC package — canonical implementations
+│   ├── server_module.go              # ServerModule (implements modular.Module)
+│   ├── stdio_transport.go            # StdioTransportModule
+│   ├── http_transport.go             # HTTPTransportModule
+│   ├── tool_trigger.go               # ToolTrigger
+│   ├── tool_registry.go              # ToolRegistryModule (tool bookkeeping for lifecycle)
+│   ├── schemas.go                    # UI schema definitions
+│   ├── plugin.go                     # MCPPlugin (implements plugin.EnginePlugin) — in-process entry
+│   └── *_test.go
+├── internal/
+│   ├── plugin.go                     # sdk.PluginProvider/ModuleProvider/TriggerProvider
+│   ├── module_adapter.go             # wraps mcp.* modules as sdk.ModuleInstance
+│   └── trigger_adapter.go            # wraps mcp.ToolTrigger as sdk.TriggerInstance
+└── plugin.json
+```
+
+**Why public `mcp/` (not `internal/mcp/`):** zoom-mcp must `import "github.com/GoCodeAlone/workflow-plugin-mcp/mcp"` to wire `mcp.New()` (the `EnginePlugin`) into its engine — Go's `internal/` visibility would block that.
+
 ### Task 2.1: Create the plugin repo from template
 
 **Step 1:** Create repo from template.
@@ -1005,62 +1037,136 @@ git push
 
 ---
 
-### Task 2.2: `mcp.server` module — skeleton + test
+### Task 2.2: `mcp.server` module + tool registry — skeleton + test
 
 **Files:**
-- Create: `~/Projects/workflow-plugin-mcp/internal/mcp/server_module.go`
-- Create: `~/Projects/workflow-plugin-mcp/internal/mcp/server_module_test.go`
+- Create: `~/Projects/workflow-plugin-mcp/mcp/server_module.go`
+- Create: `~/Projects/workflow-plugin-mcp/mcp/server_module_test.go`
+- Create: `~/Projects/workflow-plugin-mcp/mcp/tool_registry.go`
+- Create: `~/Projects/workflow-plugin-mcp/mcp/tool_registry_test.go`
 
-**Step 1:** Write failing test.
+**Package note:** Use the import alias `mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"` inside `package mcp` so the package name doesn't collide with the SDK. All references to `mcp.Server`, `mcp.Tool`, etc. in the example code below become `mcpsdk.Server`, `mcpsdk.Tool`.
+
+**Step 1:** Write failing tests (module-level test file `package mcp_test` so it exercises the public API).
 
 ```go
-func TestServerModule_InitBindsInstance(t *testing.T) {
-	app := modular.NewTestApp(t)
-	mod := mcp.NewServerModule(mcp.ServerConfig{
+func TestServerModule_InitCreatesServer(t *testing.T) {
+	mod := mcp.NewServerModule("my-mcp", mcp.ServerConfig{
 		Implementation: mcp.Implementation{Name: "test", Version: "0.0.1"},
 	})
-	// register mod with app, run Init, assert that the service registry has an
-	// *mcp.Server registered under mod.Name()
+	// Standalone init (no app injection needed for the basic case):
+	if err := mod.Init(nil); err != nil { t.Fatal(err) }
+	if mod.Server() == nil { t.Fatal("server nil") }
 }
 
-func TestServerModule_AddTool_ValidatesSchemaIsObject(t *testing.T) {
-	// creating the server succeeds; registering a tool whose input_schema is
-	// not an object should error at registration time
+func TestServerModule_RequiresNonEmptyImplementation(t *testing.T) {
+	mod := mcp.NewServerModule("m", mcp.ServerConfig{})
+	if err := mod.Init(nil); err == nil {
+		t.Fatal("expected error for empty Implementation")
+	}
 }
 ```
 
-Adapt to the actual Workflow/modular test harness patterns.
-
-**Step 2:** Implement the module. Core:
+**Step 2:** Implement the module.
 
 ```go
+package mcp
+
+import (
+	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
+)
+
+type Implementation struct {
+	Name    string
+	Version string
+}
+
+type ServerConfig struct {
+	Implementation Implementation
+}
+
 type ServerModule struct {
 	name   string
 	cfg    ServerConfig
-	server *mcp.Server
+	server *mcpsdk.Server
+	// registry is injected (or fetched from the modular app) in the
+	// in-process variant; see Task 2.5 for the DI wiring.
+	registry *ToolRegistry
 }
 
-func (m *ServerModule) Name() string { return m.name }
+func NewServerModule(name string, cfg ServerConfig) *ServerModule {
+	return &ServerModule{name: name, cfg: cfg}
+}
 
-func (m *ServerModule) Init(app modular.App) error {
-	m.server = mcp.NewServer(&mcp.Implementation{
+func (m *ServerModule) Name() string        { return m.name }
+func (m *ServerModule) Server() *mcpsdk.Server { return m.server }
+
+func (m *ServerModule) Init(app any) error {
+	if m.cfg.Implementation.Name == "" {
+		return fmt.Errorf("mcp.server %q: implementation.name is required", m.name)
+	}
+	m.server = mcpsdk.NewServer(&mcpsdk.Implementation{
 		Name:    m.cfg.Implementation.Name,
 		Version: m.cfg.Implementation.Version,
 	}, nil)
-	app.RegisterService(m.name, m.server)
 	return nil
 }
 
-// Start/Stop are no-ops; transports start the server via transport.Start.
+// Start/Stop: see Task 2.5 — ServerModule.Start iterates registry entries
+// and calls server.AddTool for each before transports bind.
 ```
 
-**Step 3:** Run tests — PASS.
+**Step 3:** Implement `ToolRegistry` — an in-process module whose only job is to collect tool registrations from triggers so the `ServerModule` can replay them at start time.
 
-**Step 4:** Commit.
+```go
+// mcp/tool_registry.go
+package mcp
+
+import (
+	"sync"
+	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
+)
+
+type RegisteredTool struct {
+	Tool    *mcpsdk.Tool
+	Handler mcpsdk.ToolHandler
+}
+
+type ToolRegistry struct {
+	name string
+	mu   sync.Mutex
+	tools []RegisteredTool
+}
+
+func NewToolRegistry(name string) *ToolRegistry {
+	return &ToolRegistry{name: name}
+}
+
+func (r *ToolRegistry) Name() string { return r.name }
+func (r *ToolRegistry) Init(_ any) error { return nil }
+
+func (r *ToolRegistry) Add(t *mcpsdk.Tool, h mcpsdk.ToolHandler) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.tools = append(r.tools, RegisteredTool{Tool: t, Handler: h})
+}
+
+func (r *ToolRegistry) All() []RegisteredTool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]RegisteredTool, len(r.tools))
+	copy(out, r.tools)
+	return out
+}
+```
+
+**Step 4:** Tests PASS.
+
+**Step 5:** Commit.
 
 ```
-git add internal/mcp/server_module.go internal/mcp/server_module_test.go
-git commit -m "feat: add mcp.server module"
+git add mcp/server_module.go mcp/server_module_test.go mcp/tool_registry.go mcp/tool_registry_test.go
+git commit -m "feat: add mcp.server module and tool registry"
 ```
 
 ---
@@ -1068,30 +1174,75 @@ git commit -m "feat: add mcp.server module"
 ### Task 2.3: `mcp.stdio_transport` + `mcp.http_transport`
 
 **Files:**
-- Create: `~/Projects/workflow-plugin-mcp/internal/mcp/stdio_transport.go` + test
-- Create: `~/Projects/workflow-plugin-mcp/internal/mcp/http_transport.go` + test
+- Create: `~/Projects/workflow-plugin-mcp/mcp/stdio_transport.go` + test
+- Create: `~/Projects/workflow-plugin-mcp/mcp/http_transport.go` + test
 
-**Step 1:** Write failing tests. Each transport module takes a `server: <module-name>` config, resolves the server via service registry at Init time, and in Start spawns the transport.
+**Step 1:** Write failing tests. Each transport module holds a pointer to a `*ServerModule` (injected at construction; the in-process factory pulls it from the service registry by the `server: <module-name>` config, and the gRPC adapter does the same lookup via its host callback).
 
-For `http_transport`, the test uses `httptest.NewServer(mcp.NewStreamableHTTPHandler(...))` and asserts the handler is reachable. For `stdio_transport`, test with `mcp.InMemoryTransport` as a stand-in (or test the module's Start/Stop flow against a pipe).
+For `http_transport`, the test uses `httptest.NewServer(...)` wrapping the module's handler and asserts the handler is reachable. For `stdio_transport`, test with `mcpsdk.InMemoryTransport` as a stand-in (or test the module's Start/Stop flow against a pipe).
 
 **Step 2:** Implement.
 
 ```go
-// stdio_transport.go
+// mcp/stdio_transport.go
+package mcp
+
+type StdioTransportModule struct {
+	name   string
+	server *ServerModule
+}
+
+func NewStdioTransportModule(name string, server *ServerModule) *StdioTransportModule {
+	return &StdioTransportModule{name: name, server: server}
+}
+
+func (m *StdioTransportModule) Name() string { return m.name }
+func (m *StdioTransportModule) Init(_ any) error {
+	if m.server == nil || m.server.Server() == nil {
+		return fmt.Errorf("stdio_transport %q: server not wired", m.name)
+	}
+	return nil
+}
+
 func (m *StdioTransportModule) Start(ctx context.Context) error {
 	go func() {
-		if err := m.server.Run(ctx, &mcp.StdioTransport{}); err != nil {
-			// log via modular logger
-		}
+		_ = m.server.Server().Run(ctx, &mcpsdk.StdioTransport{})
 	}()
 	return nil
 }
 
-// http_transport.go
+// mcp/http_transport.go
+package mcp
+
+type HTTPTransportConfig struct {
+	Address string
+}
+
+type HTTPTransportModule struct {
+	name    string
+	cfg     HTTPTransportConfig
+	server  *ServerModule
+	httpSrv *http.Server
+}
+
+func NewHTTPTransportModule(name string, cfg HTTPTransportConfig, server *ServerModule) *HTTPTransportModule {
+	return &HTTPTransportModule{name: name, cfg: cfg, server: server}
+}
+
+func (m *HTTPTransportModule) Name() string { return m.name }
+func (m *HTTPTransportModule) Init(_ any) error {
+	if m.server == nil || m.server.Server() == nil {
+		return fmt.Errorf("http_transport %q: server not wired", m.name)
+	}
+	if m.cfg.Address == "" {
+		return fmt.Errorf("http_transport %q: address is required", m.name)
+	}
+	return nil
+}
+
 func (m *HTTPTransportModule) Start(ctx context.Context) error {
-	handler := mcp.NewStreamableHTTPHandler(func(r *http.Request) *mcp.Server {
-		return m.server
+	handler := mcpsdk.NewStreamableHTTPHandler(func(r *http.Request) *mcpsdk.Server {
+		return m.server.Server()
 	}, nil)
 	m.httpSrv = &http.Server{Addr: m.cfg.Address, Handler: handler}
 	go func() {
@@ -1121,7 +1272,7 @@ git commit -m "feat: add mcp.http_transport module"
 ### Task 2.4: `mcp.tool` trigger
 
 **Files:**
-- Create: `~/Projects/workflow-plugin-mcp/internal/mcp/tool_trigger.go` + test
+- Create: `~/Projects/workflow-plugin-mcp/mcp/tool_trigger.go` + test
 
 **Step 1:** Write failing test using `InMemoryTransport`.
 
@@ -1149,14 +1300,15 @@ func TestToolTrigger_ResolvesSchemaRef(t *testing.T) {
 **Step 2:** Implement the trigger.
 
 Core logic:
-1. At trigger Init: load/parse `input_schema` (inline `map[string]any` or `$ref: <path>` → read file → parse JSON).
-2. Register with the server: `server.AddTool(&mcp.Tool{Name: ..., Description: ..., InputSchema: inputSchemaMap, OutputSchema: outputSchemaMap}, handler)`.
-3. `handler` (the ToolHandler passed to AddTool):
+1. At trigger Configure/Init: load/parse `input_schema` (inline `map[string]any` or `{$ref: <path>}` → read file → parse JSON). Resolve `$ref` relative to the workflow config's directory (passed in via trigger init context — look at how `http` trigger receives config-dir in Workflow).
+2. Compile the schema with `jsonschema/v5`.
+3. Push the registration into `ToolRegistry.Add(tool, handler)` rather than calling `server.AddTool` directly. `ServerModule.Start` replays the registry so the start-order invariant holds (see Task 2.5).
+4. The `handler` (the `mcpsdk.ToolHandler`):
    - Parse `req.Params.Arguments` (json.RawMessage) into `map[string]any`.
-   - Validate against the compiled input schema (`jsonschema/v5`).
-   - If invalid, return `*CallToolResult{Content: [TextContent{Text: "invalid input: ..."}], IsError: true}, nil`.
+   - Validate against the compiled input schema.
+   - If invalid, return `*mcpsdk.CallToolResult{Content: [TextContent{Text: "invalid input: ..."}], IsError: true}, nil`.
    - Construct a pipeline event with payload `{input: argsMap, meta: {tool_name, request_id}}`.
-   - Dispatch to the named pipeline via the Workflow engine's handler-dispatch API (inspect Workflow's HTTP trigger for the exact dispatch mechanism — the MCP trigger mirrors that pattern).
+   - Dispatch to the named pipeline via the Workflow engine's handler-dispatch API (inspect Workflow's `http` trigger for the exact dispatch mechanism — the MCP trigger mirrors that pattern; look at `engine.RegisterWorkflowHandler` / `WorkflowHandler`).
    - On pipeline return: JSON-marshal the output into a `TextContent` block; set `StructuredContent` if the SDK version supports it; set `IsError: true` if the pipeline marked an error.
 
 **Step 3:** Run tests — PASS.
@@ -1169,55 +1321,151 @@ git commit -m "feat: add mcp.tool trigger for pipeline registration"
 
 ---
 
-### Task 2.5: Plugin registration + end-to-end test
+### Task 2.5: Dual-mode plugin registration + end-to-end test
+
+This task wires the core `mcp/` package into **both** consumption modes.
 
 **Files:**
-- Modify: `~/Projects/workflow-plugin-mcp/plugin.go` — the template's main plugin type. Register `ServerModule`, `StdioTransportModule`, `HTTPTransportModule` via `ModuleFactories()`. Register `ToolTrigger` via `TriggerFactories()`.
-- Modify: `~/Projects/workflow-plugin-mcp/internal/mcp/server.go` — ensure `ServerModule` declares a modular dependency on the tool-registration phase so it starts after triggers have registered.
-- Create: `~/Projects/workflow-plugin-mcp/internal/mcp/e2e_test.go`
-- Create: `~/Projects/workflow-plugin-mcp/internal/mcp/lifecycle_test.go`
+- Create: `~/Projects/workflow-plugin-mcp/mcp/plugin.go` — `MCPPlugin` type implementing `plugin.EnginePlugin` (in-process entry). Exported `New()` constructor returning `*MCPPlugin`.
+- Create: `~/Projects/workflow-plugin-mcp/mcp/schemas.go` — `ModuleSchemas()` / `StepSchemas()` (UI metadata).
+- Create: `~/Projects/workflow-plugin-mcp/mcp/lifecycle_test.go` — in-process lifecycle assertion.
+- Create: `~/Projects/workflow-plugin-mcp/mcp/e2e_test.go` — in-process end-to-end.
+- Modify: `~/Projects/workflow-plugin-mcp/internal/plugin.go` — implement `sdk.ModuleProvider` and `sdk.TriggerProvider`, delegating to `mcp/` core via adapter types.
+- Create: `~/Projects/workflow-plugin-mcp/internal/module_adapter.go` — wraps any `*mcp.ServerModule` / `*mcp.StdioTransportModule` / `*mcp.HTTPTransportModule` as `sdk.ModuleInstance`.
+- Create: `~/Projects/workflow-plugin-mcp/internal/trigger_adapter.go` — wraps `*mcp.ToolTrigger` as `sdk.TriggerInstance`.
+- Update: `plugin.json` — fill in `capabilities.moduleTypes` (`mcp.server`, `mcp.stdio_transport`, `mcp.http_transport`) and `capabilities.triggerTypes` (`mcp.tool`).
 
-**Step 1:** Implement `EnginePlugin` interface per the template.
-
-**Step 2:** Declare lifecycle ordering on `ServerModule`. The design requires `mcp.server` to start only after every `mcp.tool` trigger has registered its tool with the server, so the initial `tools/list` response is complete.
-
-Use modular's dependency declaration — whichever of these the current `github.com/GoCodeAlone/modular` exposes (check imports first):
-
-- If modular supports `DependsOn() []string`, declare it on `ServerModule` referencing the trigger service name(s).
-- If modular uses a start-order interface (e.g. `StartsAfter`), use that.
-- Otherwise, have `ToolTrigger.Register()` push into a shared registry module that `ServerModule` consumes, and wire the registry as a dependency.
-
-Concretely:
+**Step 1 — In-process `EnginePlugin`:**
 
 ```go
-// internal/mcp/server.go
-func (m *ServerModule) DependsOn() []string {
-    // The tool registry is populated by mcp.tool triggers at their Register()
-    // step; depending on it guarantees ServerModule.Start runs after all
-    // triggers have registered their tools.
-    return []string{"mcp.tool-registry"}
+// mcp/plugin.go
+package mcp
+
+import (
+	"github.com/GoCodeAlone/modular"
+	"github.com/GoCodeAlone/workflow/plugin"
+	"github.com/GoCodeAlone/workflow/schema"
+)
+
+type MCPPlugin struct {
+	plugin.BaseEnginePlugin
+}
+
+func New() *MCPPlugin {
+	return &MCPPlugin{
+		BaseEnginePlugin: plugin.BaseEnginePlugin{
+			BaseNativePlugin: plugin.BaseNativePlugin{
+				PluginName:        "workflow-plugin-mcp",
+				PluginVersion:     "0.1.0",
+				PluginDescription: "MCP (Model Context Protocol) plugin",
+			},
+			Manifest: plugin.PluginManifest{
+				Name:         "workflow-plugin-mcp",
+				Version:      "0.1.0",
+				Author:       "GoCodeAlone",
+				Description:  "MCP server, transports, and tool trigger",
+				Tier:         plugin.TierCommunity,
+				ModuleTypes:  []string{"mcp.server", "mcp.stdio_transport", "mcp.http_transport", "mcp.tool_registry"},
+				TriggerTypes: []string{"mcp.tool"},
+			},
+		},
+	}
+}
+
+func (p *MCPPlugin) ModuleFactories() map[string]plugin.ModuleFactory {
+	return map[string]plugin.ModuleFactory{
+		"mcp.server":           serverModuleFactory,
+		"mcp.stdio_transport":  stdioTransportFactory,
+		"mcp.http_transport":   httpTransportFactory,
+		"mcp.tool_registry":    toolRegistryFactory,
+	}
+}
+
+func (p *MCPPlugin) TriggerFactories() map[string]plugin.TriggerFactory {
+	return map[string]plugin.TriggerFactory{
+		"mcp.tool": func() any { return NewToolTrigger() },
+	}
 }
 ```
 
-If no explicit registry module exists, create one (`ToolRegistryModule`) whose `Register()` is a no-op and whose presence in the module graph makes the dependency edge valid; triggers obtain it via the DI container and call `Registry.Add(name, handler, schema)`; `ServerModule.Start` iterates `Registry.All()` to populate the mcp.Server before starting transports.
+Define the factory functions (`serverModuleFactory`, etc.) in `mcp/factories.go`. Each parses its config map into the strongly-typed `*ServerConfig` / `*HTTPTransportConfig` and returns a `modular.Module`. Cross-module wiring (e.g., transport → server) is done via the modular service-registry lookup at Init time.
 
-**Step 3:** Write lifecycle test (`lifecycle_test.go`): build an engine with the plugin, 2 pipelines each with `mcp.tool` triggers, and assert that by the time `ServerModule.Start` is called, both tools are visible via `mcp.Server.ListTools()` (or whatever the go-sdk exposes).
+**Step 2 — Lifecycle ordering:**
 
-**Step 4:** Write E2E test: full YAML with `mcp.server` + `mcp.stdio_transport` (using InMemoryTransport instead) + a pipeline with `mcp.tool` trigger. Start engine, send a `tools/call` from an in-memory MCP client, assert output.
+The start-order invariant is handled by the explicit `ToolRegistry` pattern (Task 2.2), not via `DependsOn`. Wire it:
 
-**Step 5:** Run tests.
+- `ToolTrigger.Configure` / `Init` resolves the `ToolRegistry` by name (config: `registry: <module-name>`; default: `mcp.tool-registry`) and calls `registry.Add(...)`.
+- `ServerModule` also resolves the same registry. `ServerModule.Start` iterates `registry.All()`, calls `server.AddTool(tool, handler)` for each, then signals ready.
+- Transports do nothing at Init except validate; their `Start()` begins serving only after `ServerModule.Start()` completes. Enforce this via a `modular` service dependency: each transport depends on the server module's service.
 
-**Step 6:** Commit.
+**Step 3 — Lifecycle test** (`mcp/lifecycle_test.go`): build an in-process engine using `plugin.New()`, register 2 pipelines each with an `mcp.tool` trigger, start the engine, then query the server's tool list (via an `InMemoryTransport` client or the server's internal accessor) and assert both tools are present before the first `tools/call`.
+
+**Step 4 — gRPC adapter** (`internal/plugin.go` + adapters):
+
+```go
+// internal/plugin.go
+package internal
+
+import (
+	"github.com/GoCodeAlone/workflow-plugin-mcp/mcp"
+	sdk "github.com/GoCodeAlone/workflow/plugin/external/sdk"
+)
+
+type plugin struct{}
+
+func NewPlugin() sdk.PluginProvider { return &plugin{} }
+
+func (p *plugin) Manifest() sdk.PluginManifest { return Manifest }
+
+func (p *plugin) ModuleTypes() []string {
+	return []string{"mcp.server", "mcp.stdio_transport", "mcp.http_transport", "mcp.tool_registry"}
+}
+
+func (p *plugin) CreateModule(typeName, name string, cfg map[string]any) (sdk.ModuleInstance, error) {
+	switch typeName {
+	case "mcp.server":
+		sc, err := mcp.ParseServerConfig(cfg)
+		if err != nil { return nil, err }
+		return wrapModule(mcp.NewServerModule(name, sc)), nil
+	// ...
+	}
+	return nil, fmt.Errorf("unknown module type %q", typeName)
+}
+
+func (p *plugin) TriggerTypes() []string { return []string{"mcp.tool"} }
+
+func (p *plugin) CreateTrigger(typeName string, cfg map[string]any, cb sdk.TriggerCallback) (sdk.TriggerInstance, error) {
+	if typeName != "mcp.tool" {
+		return nil, fmt.Errorf("unknown trigger type %q", typeName)
+	}
+	return wrapTrigger(mcp.NewToolTriggerFromConfig(cfg, cb)), nil
+}
+```
+
+The adapters (`wrapModule`, `wrapTrigger`) translate between the in-process lifecycle (`Name()`, `Init(app any) error`, `Start(ctx) error`, `Stop(ctx) error`) and the gRPC SDK lifecycle (`ModuleInstance.Init() error`, `Start(ctx) error`, `Stop(ctx) error`). Because the external gRPC subprocess has no access to the host's modular service registry, cross-module wiring across gRPC is out of scope for v0.1.0 — document this limitation in the README and keep gRPC support for the simple "one server + one transport + N tools" shape; complex wiring is the in-process path's job.
+
+**Step 5 — E2E test** (`mcp/e2e_test.go`): full in-process YAML (`mcp.server` + `mcp.stdio_transport` substituted with `InMemoryTransport` + a pipeline with `mcp.tool` trigger). Start engine, send `tools/call` from an in-memory MCP client, assert output.
+
+**Step 6 — Build verification:**
 
 ```
-git commit -m "feat: register modules and trigger in EnginePlugin; enforce server-after-triggers lifecycle; add E2E test"
+go build ./...
+go test ./...
+go build ./cmd/workflow-plugin-mcp    # ensures gRPC binary still builds
+```
+
+**Step 7 — Commit.**
+
+```
+git add mcp/ internal/ plugin.json
+git commit -m "feat: register modules/trigger in EnginePlugin and gRPC adapters; add lifecycle + E2E tests"
 ```
 
 ---
 
 ### Task 2.6: README + tag v0.1.0
 
-**Step 1:** Write README with: overview, install/import, YAML shape for all three modules + trigger, schema handling (inline vs $ref), testing with `InMemoryTransport`.
+**Step 1:** Write README with: overview, **both** usage modes (in-process import via `mcp.New()` vs external gRPC binary via `plugin.json`), YAML shape for all three modules + trigger, schema handling (inline vs `$ref`), testing with `InMemoryTransport`, and the v0.1.0 gRPC limitation (no cross-module wiring across the subprocess boundary).
 
 **Step 2:** Commit README.
 
