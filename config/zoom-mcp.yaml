@@ -1,0 +1,189 @@
+# zoom-mcp unified Workflow configuration
+#
+# A single YAML drives both the first-run setup HTTP flow and the steady-state
+# MCP tool server. The http.server on :8765 serves the setup UI and the OAuth
+# callback; the mcp.server (plus stdio and streamable-HTTP transports) exposes
+# the Zoom API as MCP tools.
+
+modules:
+  - name: zoom-secrets
+    type: secrets.keychain
+    config:
+      service: zoom-mcp
+
+  - name: zoom-client
+    type: http.client
+    config:
+      base_url: "https://api.zoom.us/v2"
+      timeout: 30s
+      auth:
+        type: oauth2_refresh_token
+        token_url: "https://zoom.us/oauth/token"
+        client_id_from_secret: { provider: zoom-secrets, key: client_id }
+        client_secret_from_secret: { provider: zoom-secrets, key: client_secret }
+        token_secrets: zoom-secrets
+        token_secrets_key: oauth_token
+
+  # Separate client for Zoom recording/transcript downloads. Zoom signs these
+  # URLs with a query-param access_token instead of an Authorization header,
+  # so the client must not attach OAuth credentials.
+  - name: zoom-download-client
+    type: http.client
+    config:
+      timeout: 60s
+      auth:
+        type: none
+
+  - name: mcp-tool-registry
+    type: mcp.tool_registry
+
+  - name: mcp-server
+    type: mcp.server
+    config:
+      implementation:
+        name: zoom-mcp
+        version: "0.1.0"
+      registry: mcp-tool-registry
+
+  - name: mcp-stdio
+    type: mcp.stdio_transport
+    config:
+      server: mcp-server
+
+  - name: mcp-http
+    type: mcp.http_transport
+    config:
+      server: mcp-server
+      address: "127.0.0.1:7823"
+
+  - name: http-server
+    type: http.server
+    config:
+      address: "127.0.0.1:8765"
+
+  - name: http-router
+    type: http.router
+    dependsOn: [http-server]
+
+workflows:
+  http:
+    router: http-router
+    server: http-server
+    routes: []
+
+pipelines:
+  # --- Setup flow ---------------------------------------------------------
+  #
+  # Browser submits the form as JSON (the http trigger only parses JSON
+  # bodies), so setup-save returns the Zoom OAuth URL as JSON and the page
+  # redirects itself. OAuth callback is a normal GET — Zoom sends the `code`
+  # as a query param, which the http trigger exposes at .trigger.code.
+
+  setup-form:
+    trigger:
+      type: http
+      config:
+        method: GET
+        path: /setup
+    steps:
+      - type: step.raw_response
+        config:
+          content_type: "text/html; charset=utf-8"
+          body: |
+            <!doctype html><html><body style="font-family:system-ui; max-width:480px; margin:2em auto;">
+              <h1>Zoom MCP — Setup</h1>
+              <p>Register <code>http://127.0.0.1:8765/oauth/callback</code> as a redirect URI
+                 in your <a href="https://marketplace.zoom.us/user/build" target="_blank">Zoom OAuth app</a>.</p>
+              <form id="setup-form">
+                <label>Client ID<br><input name="client_id" required style="width:100%"/></label><br><br>
+                <label>Client Secret<br><input name="client_secret" type="password" required style="width:100%"/></label><br><br>
+                <button type="submit">Authorize with Zoom →</button>
+              </form>
+              <script>
+                document.getElementById('setup-form').addEventListener('submit', async (e) => {
+                  e.preventDefault();
+                  const body = {
+                    client_id: e.target.client_id.value,
+                    client_secret: e.target.client_secret.value,
+                  };
+                  const res = await fetch('/setup', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body),
+                  });
+                  const data = await res.json();
+                  if (data.redirect_url) {
+                    window.location = data.redirect_url;
+                  } else {
+                    document.body.insertAdjacentHTML('beforeend',
+                      '<p style="color:red">Error: ' + (data.error || 'unknown') + '</p>');
+                  }
+                });
+              </script>
+            </body></html>
+
+  setup-save:
+    trigger:
+      type: http
+      config:
+        method: POST
+        path: /setup
+    steps:
+      - type: step.secret_set
+        config:
+          module: zoom-secrets
+          secrets:
+            client_id: '{{ .trigger.body.client_id }}'
+            client_secret: '{{ .trigger.body.client_secret }}'
+      - type: step.json_response
+        config:
+          status: 200
+          body:
+            redirect_url: >
+              https://zoom.us/oauth/authorize?response_type=code&client_id={{
+              urlEncode .trigger.body.client_id }}&redirect_uri={{
+              urlEncode "http://127.0.0.1:8765/oauth/callback" }}&state={{
+              uuid }}&scope=user:read:user+meeting:read:list_meetings+meeting:read:meeting+meeting:read:past_meeting+meeting:read:list_past_instances+meeting:read:list_past_participants+meeting:read:summary+meeting:read:list_summaries+cloud_recording:read:list_user_recordings+cloud_recording:read:list_recording_files+cloud_recording:read:meeting_transcript+chat:read:list_user_channels+chat:read:user_channel+chat:read:list_user_messages+chat:read:user_message
+
+  oauth-callback:
+    trigger:
+      type: http
+      config:
+        method: GET
+        path: /oauth/callback
+    steps:
+      - name: fetch-creds
+        type: step.secret_fetch
+        config:
+          module: zoom-secrets
+          secrets:
+            client_id: client_id
+            client_secret: client_secret
+      - name: build-token-body
+        type: step.set
+        config:
+          values:
+            body: 'grant_type=authorization_code&code={{ urlEncode .trigger.code }}&redirect_uri={{ urlEncode "http://127.0.0.1:8765/oauth/callback" }}'
+      - name: token-exchange
+        type: step.http_call
+        config:
+          url: "https://zoom.us/oauth/token"
+          method: POST
+          headers:
+            Content-Type: "application/x-www-form-urlencoded"
+            Authorization: 'Basic {{ b64 (printf "%s:%s" (step "fetch-creds" "client_id") (step "fetch-creds" "client_secret")) }}'
+          body_from: "steps.build-token-body.body"
+      - type: step.secret_set
+        config:
+          module: zoom-secrets
+          secrets:
+            oauth_token: '{{ json (step "token-exchange" "body") }}'
+      - type: step.raw_response
+        config:
+          content_type: "text/html; charset=utf-8"
+          body: |
+            <!doctype html><html><body style="font-family:system-ui; text-align:center; margin-top:4em;">
+              <h1>✓ Authorized</h1><p>You can close this tab.</p>
+            </body></html>
+
+  # --- MCP tool pipelines will be added in Task 3.4 -----------------------
