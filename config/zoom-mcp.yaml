@@ -186,4 +186,657 @@ pipelines:
               <h1>✓ Authorized</h1><p>You can close this tab.</p>
             </body></html>
 
-  # --- MCP tool pipelines will be added in Task 3.4 -----------------------
+  # --- MCP tool pipelines -------------------------------------------------
+  #
+  # Each pipeline registers one MCP tool via the `mcp.tool` trigger.
+  # Pattern: step.http_call → step.jq → step.pipeline_output.
+  #
+  # `error_on_status: false` on each http_call lets the jq step inspect the
+  # response and produce the unified success/error shape defined by the
+  # tool's output schema:
+  #   success: { ok: true,  data:  <tool-specific payload> }
+  #   error:   { ok: false, error: { code, message, retry_after? } }
+  #
+  # Status-code mapping (applied in every error branch):
+  #   401 → not_authenticated  (token missing/invalid — re-run setup)
+  #   403 → scope_missing      (OAuth app missing a required scope)
+  #   404 → not_found          (resource not found; overridden per-tool where needed)
+  #   429 → rate_limited       (includes retry_after from Retry-After header)
+  #   else → zoom_error        (generic passthrough of Zoom's error message)
+  #
+  # Paginated tools use `step.while` with `iteration_var: iter` so the first
+  # iteration runs unconditionally and subsequent iterations run only while
+  # the last call succeeded (2xx) and returned a non-empty next_page_token.
+
+  get_me:
+    trigger:
+      type: mcp.tool
+      config:
+        server: mcp-server
+        registry: mcp-tool-registry
+        name: get_me
+        description: "Get the authenticated user's Zoom profile (id, email, name, type)."
+        input_schema:
+          type: object
+          properties: {}
+    steps:
+      - name: call
+        type: step.http_call
+        config:
+          client: zoom-client
+          url: "/users/me"
+          method: GET
+          error_on_status: false
+      - name: shape
+        type: step.jq
+        config:
+          input_from: steps.call
+          expression: |
+            if .status_code < 400 then {ok: true, data: .body}
+            elif .status_code == 401 then {ok: false, error: {code: "not_authenticated", message: "Zoom OAuth token is missing or invalid; run setup flow."}}
+            elif .status_code == 403 then {ok: false, error: {code: "scope_missing", message: (.body.message // "required OAuth scope is missing")}}
+            elif .status_code == 404 then {ok: false, error: {code: "not_found", message: (.body.message // "resource not found")}}
+            elif .status_code == 429 then {ok: false, error: {code: "rate_limited", message: "Zoom rate limit exceeded", retry_after: ((.headers["Retry-After"] // "60") | tonumber)}}
+            else {ok: false, error: {code: "zoom_error", message: (.body.message // ("HTTP " + (.status_code | tostring)))}}
+            end
+      - type: step.pipeline_output
+        config:
+          source: steps.shape.result
+
+  list_meetings:
+    trigger:
+      type: mcp.tool
+      config:
+        server: mcp-server
+        registry: mcp-tool-registry
+        name: list_meetings
+        description: "List the authenticated user's meetings across all pages."
+        input_schema:
+          type: object
+          properties:
+            type:
+              type: string
+              enum: [scheduled, live, upcoming, upcoming_meetings, previous_meetings]
+              default: upcoming
+              description: "Which set of meetings to return. Defaults to 'upcoming'."
+    steps:
+      - name: paginate
+        type: step.while
+        config:
+          condition: |
+            {{- if .iter.first -}}yes{{- else if and (lt (toInt .steps.call.status_code) 400) .steps.call.body.next_page_token -}}yes{{- end -}}
+          max_iterations: 100
+          iteration_var: iter
+          accumulate:
+            key: meetings
+            from: "{{.steps.call.body.meetings}}"
+          steps:
+            - name: call
+              type: step.http_call
+              config:
+                client: zoom-client
+                url: '/users/me/meetings?page_size=100&type={{ default "upcoming" .input.type }}{{ if .steps.call.body.next_page_token }}&next_page_token={{ urlEncode .steps.call.body.next_page_token }}{{ end }}'
+                method: GET
+                error_on_status: false
+      - name: shape
+        type: step.jq
+        config:
+          input_from: steps
+          expression: |
+            (.call // {}) as $r |
+            if ($r.status_code // 0) < 400 then {ok: true, data: {meetings: (.paginate.meetings // [])}}
+            elif $r.status_code == 401 then {ok: false, error: {code: "not_authenticated", message: "Zoom OAuth token is missing or invalid; run setup flow."}}
+            elif $r.status_code == 403 then {ok: false, error: {code: "scope_missing", message: ($r.body.message // "required OAuth scope is missing")}}
+            elif $r.status_code == 404 then {ok: false, error: {code: "not_found", message: ($r.body.message // "resource not found")}}
+            elif $r.status_code == 429 then {ok: false, error: {code: "rate_limited", message: "Zoom rate limit exceeded", retry_after: (($r.headers["Retry-After"] // "60") | tonumber)}}
+            else {ok: false, error: {code: "zoom_error", message: ($r.body.message // ("HTTP " + ($r.status_code | tostring)))}}
+            end
+      - type: step.pipeline_output
+        config:
+          source: steps.shape.result
+
+  get_meeting:
+    trigger:
+      type: mcp.tool
+      config:
+        server: mcp-server
+        registry: mcp-tool-registry
+        name: get_meeting
+        description: "Get a single meeting's details by meeting ID."
+        input_schema:
+          type: object
+          properties:
+            meetingId: { type: string, description: "The meeting ID." }
+          required: [meetingId]
+    steps:
+      - name: call
+        type: step.http_call
+        config:
+          client: zoom-client
+          url: "/meetings/{{ .input.meetingId }}"
+          method: GET
+          error_on_status: false
+      - name: shape
+        type: step.jq
+        config:
+          input_from: steps.call
+          expression: |
+            if .status_code < 400 then {ok: true, data: .body}
+            elif .status_code == 401 then {ok: false, error: {code: "not_authenticated", message: "Zoom OAuth token is missing or invalid; run setup flow."}}
+            elif .status_code == 403 then {ok: false, error: {code: "scope_missing", message: (.body.message // "required OAuth scope is missing")}}
+            elif .status_code == 404 then {ok: false, error: {code: "not_found", message: (.body.message // "meeting not found")}}
+            elif .status_code == 429 then {ok: false, error: {code: "rate_limited", message: "Zoom rate limit exceeded", retry_after: ((.headers["Retry-After"] // "60") | tonumber)}}
+            else {ok: false, error: {code: "zoom_error", message: (.body.message // ("HTTP " + (.status_code | tostring)))}}
+            end
+      - type: step.pipeline_output
+        config:
+          source: steps.shape.result
+
+  get_past_meeting:
+    trigger:
+      type: mcp.tool
+      config:
+        server: mcp-server
+        registry: mcp-tool-registry
+        name: get_past_meeting
+        description: "Get details of a past meeting by meeting ID or UUID."
+        input_schema:
+          type: object
+          properties:
+            meetingId: { type: string, description: "The past meeting ID or UUID." }
+          required: [meetingId]
+    steps:
+      - name: call
+        type: step.http_call
+        config:
+          client: zoom-client
+          url: "/past_meetings/{{ .input.meetingId }}"
+          method: GET
+          error_on_status: false
+      - name: shape
+        type: step.jq
+        config:
+          input_from: steps.call
+          expression: |
+            if .status_code < 400 then {ok: true, data: .body}
+            elif .status_code == 401 then {ok: false, error: {code: "not_authenticated", message: "Zoom OAuth token is missing or invalid; run setup flow."}}
+            elif .status_code == 403 then {ok: false, error: {code: "scope_missing", message: (.body.message // "required OAuth scope is missing")}}
+            elif .status_code == 404 then {ok: false, error: {code: "not_found", message: (.body.message // "past meeting not found")}}
+            elif .status_code == 429 then {ok: false, error: {code: "rate_limited", message: "Zoom rate limit exceeded", retry_after: ((.headers["Retry-After"] // "60") | tonumber)}}
+            else {ok: false, error: {code: "zoom_error", message: (.body.message // ("HTTP " + (.status_code | tostring)))}}
+            end
+      - type: step.pipeline_output
+        config:
+          source: steps.shape.result
+
+  list_past_meeting_instances:
+    trigger:
+      type: mcp.tool
+      config:
+        server: mcp-server
+        registry: mcp-tool-registry
+        name: list_past_meeting_instances
+        description: "List past occurrences (instances) of a recurring meeting."
+        input_schema:
+          type: object
+          properties:
+            meetingId: { type: string, description: "The meeting ID." }
+          required: [meetingId]
+    steps:
+      - name: call
+        type: step.http_call
+        config:
+          client: zoom-client
+          url: "/past_meetings/{{ .input.meetingId }}/instances"
+          method: GET
+          error_on_status: false
+      - name: shape
+        type: step.jq
+        config:
+          input_from: steps.call
+          expression: |
+            if .status_code < 400 then {ok: true, data: .body}
+            elif .status_code == 401 then {ok: false, error: {code: "not_authenticated", message: "Zoom OAuth token is missing or invalid; run setup flow."}}
+            elif .status_code == 403 then {ok: false, error: {code: "scope_missing", message: (.body.message // "required OAuth scope is missing")}}
+            elif .status_code == 404 then {ok: false, error: {code: "not_found", message: (.body.message // "meeting not found")}}
+            elif .status_code == 429 then {ok: false, error: {code: "rate_limited", message: "Zoom rate limit exceeded", retry_after: ((.headers["Retry-After"] // "60") | tonumber)}}
+            else {ok: false, error: {code: "zoom_error", message: (.body.message // ("HTTP " + (.status_code | tostring)))}}
+            end
+      - type: step.pipeline_output
+        config:
+          source: steps.shape.result
+
+  list_past_meeting_participants:
+    trigger:
+      type: mcp.tool
+      config:
+        server: mcp-server
+        registry: mcp-tool-registry
+        name: list_past_meeting_participants
+        description: "List participants of a past meeting (paginated across all pages)."
+        input_schema:
+          type: object
+          properties:
+            meetingId: { type: string, description: "The past meeting ID or UUID." }
+          required: [meetingId]
+    steps:
+      - name: paginate
+        type: step.while
+        config:
+          condition: |
+            {{- if .iter.first -}}yes{{- else if and (lt (toInt .steps.call.status_code) 400) .steps.call.body.next_page_token -}}yes{{- end -}}
+          max_iterations: 100
+          iteration_var: iter
+          accumulate:
+            key: participants
+            from: "{{.steps.call.body.participants}}"
+          steps:
+            - name: call
+              type: step.http_call
+              config:
+                client: zoom-client
+                url: '/past_meetings/{{ .input.meetingId }}/participants?page_size=100{{ if .steps.call.body.next_page_token }}&next_page_token={{ urlEncode .steps.call.body.next_page_token }}{{ end }}'
+                method: GET
+                error_on_status: false
+      - name: shape
+        type: step.jq
+        config:
+          input_from: steps
+          expression: |
+            (.call // {}) as $r |
+            if ($r.status_code // 0) < 400 then {ok: true, data: {participants: (.paginate.participants // [])}}
+            elif $r.status_code == 401 then {ok: false, error: {code: "not_authenticated", message: "Zoom OAuth token is missing or invalid; run setup flow."}}
+            elif $r.status_code == 403 then {ok: false, error: {code: "scope_missing", message: ($r.body.message // "required OAuth scope is missing")}}
+            elif $r.status_code == 404 then {ok: false, error: {code: "not_found", message: ($r.body.message // "meeting not found")}}
+            elif $r.status_code == 429 then {ok: false, error: {code: "rate_limited", message: "Zoom rate limit exceeded", retry_after: (($r.headers["Retry-After"] // "60") | tonumber)}}
+            else {ok: false, error: {code: "zoom_error", message: ($r.body.message // ("HTTP " + ($r.status_code | tostring)))}}
+            end
+      - type: step.pipeline_output
+        config:
+          source: steps.shape.result
+
+  list_recordings:
+    trigger:
+      type: mcp.tool
+      config:
+        server: mcp-server
+        registry: mcp-tool-registry
+        name: list_recordings
+        description: "List cloud recordings for the authenticated user (paginated). Optional from/to date range (YYYY-MM-DD)."
+        input_schema:
+          type: object
+          properties:
+            from: { type: string, format: date, description: "Start date (YYYY-MM-DD). Defaults to Zoom's server default (~1 month ago)." }
+            to:   { type: string, format: date, description: "End date (YYYY-MM-DD). Defaults to today." }
+    steps:
+      - name: paginate
+        type: step.while
+        config:
+          condition: |
+            {{- if .iter.first -}}yes{{- else if and (lt (toInt .steps.call.status_code) 400) .steps.call.body.next_page_token -}}yes{{- end -}}
+          max_iterations: 100
+          iteration_var: iter
+          accumulate:
+            key: meetings
+            from: "{{.steps.call.body.meetings}}"
+          steps:
+            - name: call
+              type: step.http_call
+              config:
+                client: zoom-client
+                url: '/users/me/recordings?page_size=100{{ if .input.from }}&from={{ urlEncode .input.from }}{{ end }}{{ if .input.to }}&to={{ urlEncode .input.to }}{{ end }}{{ if .steps.call.body.next_page_token }}&next_page_token={{ urlEncode .steps.call.body.next_page_token }}{{ end }}'
+                method: GET
+                error_on_status: false
+      - name: shape
+        type: step.jq
+        config:
+          input_from: steps
+          expression: |
+            (.call // {}) as $r |
+            if ($r.status_code // 0) < 400 then {ok: true, data: {meetings: (.paginate.meetings // [])}}
+            elif $r.status_code == 401 then {ok: false, error: {code: "not_authenticated", message: "Zoom OAuth token is missing or invalid; run setup flow."}}
+            elif $r.status_code == 403 then {ok: false, error: {code: "scope_missing", message: ($r.body.message // "required OAuth scope is missing")}}
+            elif $r.status_code == 404 then {ok: false, error: {code: "not_found", message: ($r.body.message // "recordings not found")}}
+            elif $r.status_code == 429 then {ok: false, error: {code: "rate_limited", message: "Zoom rate limit exceeded", retry_after: (($r.headers["Retry-After"] // "60") | tonumber)}}
+            else {ok: false, error: {code: "zoom_error", message: ($r.body.message // ("HTTP " + ($r.status_code | tostring)))}}
+            end
+      - type: step.pipeline_output
+        config:
+          source: steps.shape.result
+
+  get_meeting_recordings:
+    trigger:
+      type: mcp.tool
+      config:
+        server: mcp-server
+        registry: mcp-tool-registry
+        name: get_meeting_recordings
+        description: "Get cloud recordings (video, audio, chat, transcript files) for a specific meeting."
+        input_schema:
+          type: object
+          properties:
+            meetingId: { type: string, description: "The meeting ID or UUID." }
+          required: [meetingId]
+    steps:
+      - name: call
+        type: step.http_call
+        config:
+          client: zoom-client
+          url: "/meetings/{{ .input.meetingId }}/recordings"
+          method: GET
+          error_on_status: false
+      - name: shape
+        type: step.jq
+        config:
+          input_from: steps.call
+          expression: |
+            if .status_code < 400 then {ok: true, data: .body}
+            elif .status_code == 401 then {ok: false, error: {code: "not_authenticated", message: "Zoom OAuth token is missing or invalid; run setup flow."}}
+            elif .status_code == 403 then {ok: false, error: {code: "scope_missing", message: (.body.message // "required OAuth scope is missing")}}
+            elif .status_code == 404 then {ok: false, error: {code: "not_found", message: (.body.message // "meeting or recordings not found")}}
+            elif .status_code == 429 then {ok: false, error: {code: "rate_limited", message: "Zoom rate limit exceeded", retry_after: ((.headers["Retry-After"] // "60") | tonumber)}}
+            else {ok: false, error: {code: "zoom_error", message: (.body.message // ("HTTP " + (.status_code | tostring)))}}
+            end
+      - type: step.pipeline_output
+        config:
+          source: steps.shape.result
+
+  # get_transcript: v1 simplification — try direct /meetings/{id}/transcript only.
+  # If Zoom returns 404, map to `transcript_unavailable`. A future version can
+  # fall back to scanning /meetings/{id}/recordings for a TRANSCRIPT file and
+  # downloading it via zoom-download-client.
+  get_transcript:
+    trigger:
+      type: mcp.tool
+      config:
+        server: mcp-server
+        registry: mcp-tool-registry
+        name: get_transcript
+        description: "Fetch the VTT transcript for a completed meeting, if one exists."
+        input_schema:
+          type: object
+          properties:
+            meetingId: { type: string, description: "The meeting ID or UUID." }
+          required: [meetingId]
+    steps:
+      - name: call
+        type: step.http_call
+        config:
+          client: zoom-client
+          url: "/meetings/{{ .input.meetingId }}/transcript"
+          method: GET
+          error_on_status: false
+      - name: shape
+        type: step.jq
+        config:
+          input_from: steps.call
+          expression: |
+            if .status_code < 400 then {ok: true, data: {transcript: (.body | if type == "string" then . else tostring end)}}
+            elif .status_code == 401 then {ok: false, error: {code: "not_authenticated", message: "Zoom OAuth token is missing or invalid; run setup flow."}}
+            elif .status_code == 403 then {ok: false, error: {code: "scope_missing", message: ((.body | if type == "object" then .message else null end) // "required OAuth scope is missing")}}
+            elif .status_code == 404 then {ok: false, error: {code: "transcript_unavailable", message: "No transcript is available for this meeting."}}
+            elif .status_code == 429 then {ok: false, error: {code: "rate_limited", message: "Zoom rate limit exceeded", retry_after: ((.headers["Retry-After"] // "60") | tonumber)}}
+            else {ok: false, error: {code: "zoom_error", message: ((.body | if type == "object" then .message else null end) // ("HTTP " + (.status_code | tostring)))}}
+            end
+      - type: step.pipeline_output
+        config:
+          source: steps.shape.result
+
+  get_meeting_summary:
+    trigger:
+      type: mcp.tool
+      config:
+        server: mcp-server
+        registry: mcp-tool-registry
+        name: get_meeting_summary
+        description: "Get the AI Companion summary for a meeting. Returns ai_companion_unavailable when no summary exists."
+        input_schema:
+          type: object
+          properties:
+            meetingId: { type: string, description: "The meeting ID or UUID." }
+          required: [meetingId]
+    steps:
+      - name: call
+        type: step.http_call
+        config:
+          client: zoom-client
+          url: "/meetings/{{ .input.meetingId }}/meeting_summary"
+          method: GET
+          error_on_status: false
+      - name: shape
+        type: step.jq
+        config:
+          input_from: steps.call
+          expression: |
+            if .status_code < 400 then {ok: true, data: .body}
+            elif .status_code == 401 then {ok: false, error: {code: "not_authenticated", message: "Zoom OAuth token is missing or invalid; run setup flow."}}
+            elif .status_code == 403 then {ok: false, error: {code: "scope_missing", message: (.body.message // "required OAuth scope is missing")}}
+            elif .status_code == 404 then {ok: false, error: {code: "ai_companion_unavailable", message: "AI Companion summary is not available for this meeting."}}
+            elif .status_code == 429 then {ok: false, error: {code: "rate_limited", message: "Zoom rate limit exceeded", retry_after: ((.headers["Retry-After"] // "60") | tonumber)}}
+            else {ok: false, error: {code: "zoom_error", message: (.body.message // ("HTTP " + (.status_code | tostring)))}}
+            end
+      - type: step.pipeline_output
+        config:
+          source: steps.shape.result
+
+  list_meeting_summaries:
+    trigger:
+      type: mcp.tool
+      config:
+        server: mcp-server
+        registry: mcp-tool-registry
+        name: list_meeting_summaries
+        description: "List AI Companion meeting summaries (paginated). Optional from/to date range (YYYY-MM-DD)."
+        input_schema:
+          type: object
+          properties:
+            from: { type: string, format: date, description: "Start date (YYYY-MM-DD)." }
+            to:   { type: string, format: date, description: "End date (YYYY-MM-DD)." }
+    steps:
+      - name: paginate
+        type: step.while
+        config:
+          condition: |
+            {{- if .iter.first -}}yes{{- else if and (lt (toInt .steps.call.status_code) 400) .steps.call.body.next_page_token -}}yes{{- end -}}
+          max_iterations: 100
+          iteration_var: iter
+          accumulate:
+            key: summaries
+            from: "{{.steps.call.body.summaries}}"
+          steps:
+            - name: call
+              type: step.http_call
+              config:
+                client: zoom-client
+                url: '/users/me/meeting_summaries?page_size=100{{ if .input.from }}&from={{ urlEncode .input.from }}{{ end }}{{ if .input.to }}&to={{ urlEncode .input.to }}{{ end }}{{ if .steps.call.body.next_page_token }}&next_page_token={{ urlEncode .steps.call.body.next_page_token }}{{ end }}'
+                method: GET
+                error_on_status: false
+      - name: shape
+        type: step.jq
+        config:
+          input_from: steps
+          expression: |
+            (.call // {}) as $r |
+            if ($r.status_code // 0) < 400 then {ok: true, data: {summaries: (.paginate.summaries // [])}}
+            elif $r.status_code == 401 then {ok: false, error: {code: "not_authenticated", message: "Zoom OAuth token is missing or invalid; run setup flow."}}
+            elif $r.status_code == 403 then {ok: false, error: {code: "scope_missing", message: ($r.body.message // "required OAuth scope is missing")}}
+            elif $r.status_code == 404 then {ok: false, error: {code: "not_found", message: ($r.body.message // "resource not found")}}
+            elif $r.status_code == 429 then {ok: false, error: {code: "rate_limited", message: "Zoom rate limit exceeded", retry_after: (($r.headers["Retry-After"] // "60") | tonumber)}}
+            else {ok: false, error: {code: "zoom_error", message: ($r.body.message // ("HTTP " + ($r.status_code | tostring)))}}
+            end
+      - type: step.pipeline_output
+        config:
+          source: steps.shape.result
+
+  list_chat_channels:
+    trigger:
+      type: mcp.tool
+      config:
+        server: mcp-server
+        registry: mcp-tool-registry
+        name: list_chat_channels
+        description: "List Zoom Team Chat channels the authenticated user is a member of (paginated)."
+        input_schema:
+          type: object
+          properties: {}
+    steps:
+      - name: paginate
+        type: step.while
+        config:
+          condition: |
+            {{- if .iter.first -}}yes{{- else if and (lt (toInt .steps.call.status_code) 400) .steps.call.body.next_page_token -}}yes{{- end -}}
+          max_iterations: 100
+          iteration_var: iter
+          accumulate:
+            key: channels
+            from: "{{.steps.call.body.channels}}"
+          steps:
+            - name: call
+              type: step.http_call
+              config:
+                client: zoom-client
+                url: '/chat/users/me/channels?page_size=50{{ if .steps.call.body.next_page_token }}&next_page_token={{ urlEncode .steps.call.body.next_page_token }}{{ end }}'
+                method: GET
+                error_on_status: false
+      - name: shape
+        type: step.jq
+        config:
+          input_from: steps
+          expression: |
+            (.call // {}) as $r |
+            if ($r.status_code // 0) < 400 then {ok: true, data: {channels: (.paginate.channels // [])}}
+            elif $r.status_code == 401 then {ok: false, error: {code: "not_authenticated", message: "Zoom OAuth token is missing or invalid; run setup flow."}}
+            elif $r.status_code == 403 then {ok: false, error: {code: "scope_missing", message: ($r.body.message // "required OAuth scope is missing")}}
+            elif $r.status_code == 404 then {ok: false, error: {code: "not_found", message: ($r.body.message // "resource not found")}}
+            elif $r.status_code == 429 then {ok: false, error: {code: "rate_limited", message: "Zoom rate limit exceeded", retry_after: (($r.headers["Retry-After"] // "60") | tonumber)}}
+            else {ok: false, error: {code: "zoom_error", message: ($r.body.message // ("HTTP " + ($r.status_code | tostring)))}}
+            end
+      - type: step.pipeline_output
+        config:
+          source: steps.shape.result
+
+  get_chat_channel:
+    trigger:
+      type: mcp.tool
+      config:
+        server: mcp-server
+        registry: mcp-tool-registry
+        name: get_chat_channel
+        description: "Get a single Zoom Team Chat channel by ID."
+        input_schema:
+          type: object
+          properties:
+            channelId: { type: string, description: "The chat channel ID." }
+          required: [channelId]
+    steps:
+      - name: call
+        type: step.http_call
+        config:
+          client: zoom-client
+          url: "/chat/channels/{{ .input.channelId }}"
+          method: GET
+          error_on_status: false
+      - name: shape
+        type: step.jq
+        config:
+          input_from: steps.call
+          expression: |
+            if .status_code < 400 then {ok: true, data: .body}
+            elif .status_code == 401 then {ok: false, error: {code: "not_authenticated", message: "Zoom OAuth token is missing or invalid; run setup flow."}}
+            elif .status_code == 403 then {ok: false, error: {code: "scope_missing", message: (.body.message // "required OAuth scope is missing")}}
+            elif .status_code == 404 then {ok: false, error: {code: "not_found", message: (.body.message // "channel not found")}}
+            elif .status_code == 429 then {ok: false, error: {code: "rate_limited", message: "Zoom rate limit exceeded", retry_after: ((.headers["Retry-After"] // "60") | tonumber)}}
+            else {ok: false, error: {code: "zoom_error", message: (.body.message // ("HTTP " + (.status_code | tostring)))}}
+            end
+      - type: step.pipeline_output
+        config:
+          source: steps.shape.result
+
+  list_chat_messages:
+    trigger:
+      type: mcp.tool
+      config:
+        server: mcp-server
+        registry: mcp-tool-registry
+        name: list_chat_messages
+        description: "List messages in a chat channel or direct thread (paginated). Provide exactly one of to_channel or to_contact."
+        input_schema:
+          type: object
+          properties:
+            to_channel: { type: string, description: "Channel ID to list messages from." }
+            to_contact: { type: string, description: "Contact email or user ID to list direct messages with." }
+          oneOf:
+            - { required: [to_channel] }
+            - { required: [to_contact] }
+    steps:
+      - name: paginate
+        type: step.while
+        config:
+          condition: |
+            {{- if .iter.first -}}yes{{- else if and (lt (toInt .steps.call.status_code) 400) .steps.call.body.next_page_token -}}yes{{- end -}}
+          max_iterations: 100
+          iteration_var: iter
+          accumulate:
+            key: messages
+            from: "{{.steps.call.body.messages}}"
+          steps:
+            - name: call
+              type: step.http_call
+              config:
+                client: zoom-client
+                url: '/chat/users/me/messages?page_size=50{{ if .input.to_channel }}&to_channel={{ urlEncode .input.to_channel }}{{ else }}&to_contact={{ urlEncode .input.to_contact }}{{ end }}{{ if .steps.call.body.next_page_token }}&next_page_token={{ urlEncode .steps.call.body.next_page_token }}{{ end }}'
+                method: GET
+                error_on_status: false
+      - name: shape
+        type: step.jq
+        config:
+          input_from: steps
+          expression: |
+            (.call // {}) as $r |
+            if ($r.status_code // 0) < 400 then {ok: true, data: {messages: (.paginate.messages // [])}}
+            elif $r.status_code == 401 then {ok: false, error: {code: "not_authenticated", message: "Zoom OAuth token is missing or invalid; run setup flow."}}
+            elif $r.status_code == 403 then {ok: false, error: {code: "scope_missing", message: ($r.body.message // "required OAuth scope is missing")}}
+            elif $r.status_code == 404 then {ok: false, error: {code: "not_found", message: ($r.body.message // "channel or contact not found")}}
+            elif $r.status_code == 429 then {ok: false, error: {code: "rate_limited", message: "Zoom rate limit exceeded", retry_after: (($r.headers["Retry-After"] // "60") | tonumber)}}
+            else {ok: false, error: {code: "zoom_error", message: ($r.body.message // ("HTTP " + ($r.status_code | tostring)))}}
+            end
+      - type: step.pipeline_output
+        config:
+          source: steps.shape.result
+
+  get_chat_message:
+    trigger:
+      type: mcp.tool
+      config:
+        server: mcp-server
+        registry: mcp-tool-registry
+        name: get_chat_message
+        description: "Get a single Zoom Team Chat message by ID."
+        input_schema:
+          type: object
+          properties:
+            messageId: { type: string, description: "The chat message ID." }
+          required: [messageId]
+    steps:
+      - name: call
+        type: step.http_call
+        config:
+          client: zoom-client
+          url: "/chat/messages/{{ .input.messageId }}"
+          method: GET
+          error_on_status: false
+      - name: shape
+        type: step.jq
+        config:
+          input_from: steps.call
+          expression: |
+            if .status_code < 400 then {ok: true, data: .body}
+            elif .status_code == 401 then {ok: false, error: {code: "not_authenticated", message: "Zoom OAuth token is missing or invalid; run setup flow."}}
+            elif .status_code == 403 then {ok: false, error: {code: "scope_missing", message: (.body.message // "required OAuth scope is missing")}}
+            elif .status_code == 404 then {ok: false, error: {code: "not_found", message: (.body.message // "message not found")}}
+            elif .status_code == 429 then {ok: false, error: {code: "rate_limited", message: "Zoom rate limit exceeded", retry_after: ((.headers["Retry-After"] // "60") | tonumber)}}
+            else {ok: false, error: {code: "zoom_error", message: (.body.message // ("HTTP " + (.status_code | tostring)))}}
+            end
+      - type: step.pipeline_output
+        config:
+          source: steps.shape.result
