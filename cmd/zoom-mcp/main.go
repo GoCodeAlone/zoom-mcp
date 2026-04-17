@@ -1,7 +1,7 @@
 // Command zoom-mcp is the MCP server for the Zoom API. It is a YAML-driven
-// Workflow service: a single config file (config/zoom-mcp.yaml by default)
-// wires the first-run setup web flow, the secrets keychain, and the MCP
-// tool pipelines that expose Zoom endpoints as MCP tools.
+// Workflow service: the embedded config/zoom-mcp.yaml wires the first-run
+// setup web flow, the secrets keychain, and the MCP tool pipelines that
+// expose Zoom endpoints as MCP tools.
 //
 // On first run (no Zoom credentials in the OS keychain), zoom-mcp opens the
 // setup URL in the user's browser so they can register an OAuth app. On
@@ -11,6 +11,7 @@ package main
 
 import (
 	"context"
+	_ "embed"
 	"errors"
 	"flag"
 	"fmt"
@@ -30,6 +31,9 @@ import (
 	"github.com/pkg/browser"
 )
 
+//go:embed zoom-mcp.yaml
+var embeddedConfig string
+
 const (
 	keychainService = "zoom-mcp"
 	setupURL        = "http://127.0.0.1:8765/setup"
@@ -42,10 +46,7 @@ const (
 var requiredSecrets = []string{"client_id", "client_secret", "oauth_token"}
 
 func main() {
-	var (
-		configPath = flag.String("config", "config/zoom-mcp.yaml", "path to workflow config")
-		noBrowser  = flag.Bool("no-browser", false, "don't auto-open the setup URL on first run")
-	)
+	noBrowser := flag.Bool("no-browser", false, "don't auto-open the setup URL on first run")
 	flag.Parse()
 
 	args := flag.Args()
@@ -57,7 +58,7 @@ func main() {
 		return
 	}
 
-	if err := runEngine(*configPath, *noBrowser); err != nil {
+	if err := runEngine(*noBrowser); err != nil {
 		fmt.Fprintf(os.Stderr, "zoom-mcp: %v\n", err)
 		os.Exit(1)
 	}
@@ -82,16 +83,31 @@ func runSubcommand(args []string) error {
 	}
 }
 
-func runEngine(configPath string, noBrowser bool) error {
+func runEngine(noBrowser bool) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
 	// Logger must not write to stdout — stdout is the MCP stdio transport.
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
-	cfg, err := config.LoadFromFile(configPath)
+	ready := keychainReady(ctx)
+	if !ready {
+		// The http.client module with oauth2_refresh_token auth eagerly resolves
+		// client_id / client_secret from the keychain at Start. On first run
+		// those values don't exist yet, so we seed placeholders to keep Start
+		// from failing. The setup-save pipeline overwrites them with real
+		// values once the user submits the form; the placeholders are never
+		// used for a real token refresh because watchForSetupCompletion exits
+		// the process as soon as oauth_token appears, and the next invocation
+		// resolves the real values eagerly.
+		if err := seedPlaceholderSecrets(ctx); err != nil {
+			return fmt.Errorf("seed placeholder secrets: %w", err)
+		}
+	}
+
+	cfg, err := config.LoadFromString(embeddedConfig)
 	if err != nil {
-		return fmt.Errorf("load config %q: %w", configPath, err)
+		return fmt.Errorf("load embedded config: %w", err)
 	}
 
 	app := modular.NewStdApplication(nil, logger)
@@ -108,7 +124,13 @@ func runEngine(configPath string, noBrowser bool) error {
 		return fmt.Errorf("build engine: %w", err)
 	}
 
-	ready := keychainReady(ctx)
+	if err := engine.Start(ctx); err != nil {
+		return fmt.Errorf("start engine: %w", err)
+	}
+
+	// Browser auto-open and setup-hint MCP notification happen AFTER Start
+	// so the http.server module is actually listening on 127.0.0.1:8765 when
+	// the user's browser hits it.
 	if !ready {
 		if !noBrowser {
 			_ = browser.OpenURL(setupURL)
@@ -116,17 +138,8 @@ func runEngine(configPath string, noBrowser bool) error {
 		} else {
 			fmt.Fprintln(os.Stderr, "zoom-mcp: credentials not configured; visit "+setupURL)
 		}
-	}
-
-	if err := engine.Start(ctx); err != nil {
-		return fmt.Errorf("start engine: %w", err)
-	}
-
-	// Best-effort: surface the setup URL to any connected MCP client via
-	// notifications/message once a session exists. Runs in the background;
-	// exits when the context is cancelled or a notification is delivered.
-	if !ready {
 		go notifySetup(ctx, engine, setupURL)
+		go watchForSetupCompletion(ctx, engine, cancel)
 	}
 
 	<-ctx.Done()
@@ -137,6 +150,60 @@ func runEngine(configPath string, noBrowser bool) error {
 		return fmt.Errorf("stop engine: %w", err)
 	}
 	return nil
+}
+
+// seedPlaceholderSecrets writes placeholder values for any missing client_id /
+// client_secret secrets. Only these two are seeded because they are resolved
+// eagerly at http.client Start; oauth_token is resolved lazily on the first
+// HTTP request and does not need a placeholder.
+func seedPlaceholderSecrets(ctx context.Context) error {
+	provider, err := secrets.NewKeychainProvider(keychainService)
+	if err != nil {
+		return fmt.Errorf("open keychain: %w", err)
+	}
+	for _, key := range []string{"client_id", "client_secret"} {
+		if _, err := provider.Get(ctx, key); err == nil {
+			continue
+		}
+		if err := provider.Set(ctx, key, "pending-setup"); err != nil {
+			return fmt.Errorf("seed %s: %w", key, err)
+		}
+	}
+	return nil
+}
+
+// watchForSetupCompletion polls the keychain for oauth_token. When the user
+// finishes the setup flow, the oauth-callback pipeline writes oauth_token
+// (and real client_id / client_secret over the placeholders); this goroutine
+// notices, sends a best-effort MCP log asking the client to restart, then
+// cancels the main context so the engine shuts down. The user's next
+// invocation picks up the real credentials at Start.
+func watchForSetupCompletion(ctx context.Context, engine *workflow.StdEngine, cancel context.CancelFunc) {
+	const pollInterval = 500 * time.Millisecond
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(pollInterval):
+		}
+		if !keychainReady(ctx) {
+			continue
+		}
+		if server := resolveMCPServer(engine.App()); server != nil {
+			msg := &mcpsdk.LoggingMessageParams{
+				Level:  "info",
+				Logger: "zoom-mcp",
+				Data:   "Zoom setup complete. Restart your MCP client to load the Zoom tools.",
+			}
+			for ss := range server.Sessions() {
+				_ = ss.Log(ctx, msg)
+				break
+			}
+		}
+		fmt.Fprintln(os.Stderr, "zoom-mcp: setup complete; exiting so the next run can load credentials")
+		cancel()
+		return
+	}
 }
 
 // resolveMCPServer fetches the underlying *mcpsdk.Server from the DI container.

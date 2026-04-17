@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -29,9 +30,10 @@ import (
 // inside a Go test without binding os.Stdin or TCP ports. The {{ZoomURL}} and
 // {{TokenURL}} placeholders are substituted at test time.
 //
-// It carries two tool pipelines whose shape exactly matches the production
-// YAML, exercising the step.http_call (error_on_status: false) → step.jq →
-// step.pipeline_output pattern for both the happy and the 429 branches.
+// It carries one tool pipeline (get_me) whose shape exactly matches the
+// production YAML, exercising the step.http_call (error_on_status: false) →
+// step.jq → step.pipeline_output pattern. Tests cover both the 2xx happy
+// branch and the 429 rate_limited error-mapping branch.
 const testZoomYAML = `
 modules:
   - name: zoom-secrets
@@ -101,12 +103,21 @@ pipelines:
 `
 
 type zoomMock struct {
-	// mu protects the handler swap between sub-tests.
+	mu      sync.RWMutex
 	handler http.Handler
 }
 
 func (m *zoomMock) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	m.handler.ServeHTTP(w, r)
+	m.mu.RLock()
+	h := m.handler
+	m.mu.RUnlock()
+	h.ServeHTTP(w, r)
+}
+
+func (m *zoomMock) set(h http.Handler) {
+	m.mu.Lock()
+	m.handler = h
+	m.mu.Unlock()
 }
 
 // setupTestEnv wires a mock Zoom server, a fake keychain (via go-keyring's
@@ -135,9 +146,10 @@ func setupTestEnv(t *testing.T) (ctx context.Context, session *mcpsdk.ClientSess
 		}
 	}
 
-	mock := &zoomMock{handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	mock := &zoomMock{}
+	mock.set(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unconfigured", http.StatusTeapot)
-	})}
+	}))
 	zoomSrv := httptest.NewServer(mock)
 	t.Cleanup(zoomSrv.Close)
 
@@ -202,7 +214,7 @@ func setupTestEnv(t *testing.T) (ctx context.Context, session *mcpsdk.ClientSess
 	}
 	t.Cleanup(func() { _ = sess.Close() })
 
-	setHandler = func(h http.Handler) { mock.handler = h }
+	setHandler = mock.set
 	return runCtx, sess, setHandler
 }
 

@@ -2,7 +2,7 @@
 
 A Zoom [Model Context Protocol](https://modelcontextprotocol.io/) server. Connects Claude Desktop (or any MCP client) to your Zoom account so you can ask for meetings, participants, recordings, transcripts, AI-Companion summaries, and chat history in natural language.
 
-Built on the [Workflow](https://github.com/GoCodeAlone/workflow) engine: the entire service — setup UI, OAuth flow, 15 Zoom tools — lives in a single YAML (`config/zoom-mcp.yaml`). The Go binary is thin: it loads the config, wires the MCP stdio transport, and handles first-run bootstrap.
+Built on the [Workflow](https://github.com/GoCodeAlone/workflow) engine: the entire service — setup UI, OAuth flow, 15 Zoom tools — lives in a single YAML (`cmd/zoom-mcp/zoom-mcp.yaml`) that is embedded into the binary at build time. The Go binary is thin: it loads the embedded config, wires the MCP stdio transport, and handles first-run bootstrap.
 
 ## Install
 
@@ -81,7 +81,6 @@ Error codes: `not_authenticated` (401), `scope_missing` (403), `not_found` (404)
 zoom-mcp config show     # list what's in the keychain (values redacted)
 zoom-mcp config reset    # delete client_id, client_secret, oauth_token from the keychain
 zoom-mcp --no-browser    # don't auto-open the setup URL; print it instead
-zoom-mcp --config path   # use a different workflow YAML
 ```
 
 ## Troubleshooting
@@ -94,8 +93,8 @@ zoom-mcp --config path   # use a different workflow YAML
 
 ## Architecture
 
-- `config/zoom-mcp.yaml` — the service. Modules (secrets, HTTP client with oauth2-refresh auth, MCP server, stdio + HTTP transports, tiny web server for the setup flow) + pipelines (setup form / OAuth callback + 15 tool pipelines).
-- `cmd/zoom-mcp/main.go` — thin bootstrap. Loads the YAML, loads Workflow's default plugins plus [workflow-plugin-mcp](https://github.com/GoCodeAlone/workflow-plugin-mcp), starts the engine, detects first-run and opens the browser.
+- `cmd/zoom-mcp/zoom-mcp.yaml` — the service (embedded into the binary via `//go:embed`). Modules (secrets, HTTP client with oauth2-refresh auth, MCP server, stdio + HTTP transports, tiny web server for the setup flow) + pipelines (setup form / OAuth callback + 15 tool pipelines).
+- `cmd/zoom-mcp/main.go` — thin bootstrap. Loads the embedded YAML, loads Workflow's default plugins plus [workflow-plugin-mcp](https://github.com/GoCodeAlone/workflow-plugin-mcp), starts the engine, detects first-run and opens the browser.
 - Tool pipelines use a uniform `step.http_call (error_on_status: false) → step.jq → step.pipeline_output` pattern; paginated tools wrap the call in `step.while`. The jq stage maps Zoom's HTTP status codes onto the discriminated `{ok, data/error}` shape.
 
 ## License
