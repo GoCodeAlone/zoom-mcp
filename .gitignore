@@ -31,4 +31,5 @@ go.work.sum
 # .idea/
 # .vscode/
 /zoom-mcp
+/dist/
 .claude/
